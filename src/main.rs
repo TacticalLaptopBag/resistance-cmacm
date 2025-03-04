@@ -17,7 +17,7 @@ use syslog::Formatter3164;
 #[command(version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    squadmate_cmd: SquadmateCommands,
+    squadmate_cmd: Option<SquadmateCommands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -31,7 +31,7 @@ enum SquadmateCommands {
 #[derive(Args, Debug)]
 struct SquadmateSetupArgs {
     #[arg(value_enum)]
-    email_method: SquadmateSetupEmailMethod,
+    email_method: Option<SquadmateSetupEmailMethod>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -86,25 +86,33 @@ fn setup_logging() {
     let _ = log::set_boxed_logger(syslog_box).map(|()| log::set_max_level(log::LevelFilter::Info));
 }
 
+fn prompt_yn(prompt: &str, stdout: &mut StdoutLock, stdin: &mut StdinLock) -> bool {
+    let mut buf = String::new();
+    print!("{} (y/N): ", prompt);
+    stdout.flush().unwrap();
+
+    stdin.read_line(&mut buf).unwrap_or_else(|e| {
+        eprintln!("Failed to read from standard input: {}", e);
+        process::exit(1);
+    });
+
+    if !buf.to_lowercase().starts_with("y") {
+        return false
+    }
+    true
+}
+
 fn cmd_setup_check(cp: &mut CivilProtection, stdout: &mut StdoutLock, stdin: &mut StdinLock) {
     if cp.does_config_exist() {
-        let mut buf = String::new();
-        print!("Resistance is already setup! Are you sure you want to reinitialize setup? (y/N): ");
-        stdout.flush().unwrap();
-
-        stdin.read_line(&mut buf).unwrap_or_else(|e| {
-            eprintln!("Failed to read from standard input: {}", e);
-            process::exit(1);
-        });
-
-        if !buf.to_lowercase().starts_with("y") {
-            println!("Canceled");
-            process::exit(1);
-        } else {
+        let response_yes = prompt_yn("Resistance is already setup! Are you sure you want to reinitialize setup?", stdout, stdin);
+        if response_yes {
             cp.delete_config().unwrap_or_else(|e| {
                 eprintln!("Failed to delete existing config: {}", e);
                 process::exit(1);
             });
+        } else {
+            println!("Canceled");
+            process::exit(1);
         }
     }
 }
@@ -117,6 +125,7 @@ fn cmd_setup_prompt_identity(stdout: &mut StdoutLock, stdin: &mut StdinLock) -> 
         eprintln!("Failed to read from standard input: {}", e);
         process::exit(1);
     });
+    email_name = email_name.trim_end().to_string();
 
     let mut email_address = String::new();
     print!("Enter the email address to send emails from: ");
@@ -125,6 +134,7 @@ fn cmd_setup_prompt_identity(stdout: &mut StdoutLock, stdin: &mut StdinLock) -> 
         eprintln!("Failed to read from standard input: {}", e);
         process::exit(1);
     });
+    email_address = email_address.trim_end().to_string();
 
     email::Identity {
         name: email_name,
@@ -184,33 +194,55 @@ fn cmd_setup_sendmail(cp: &mut CivilProtection) {
 
 fn cmd_setup(cp: &mut CivilProtection, args: &SquadmateSetupArgs) {
     match args.email_method {
-        SquadmateSetupEmailMethod::Smtp => cmd_setup_smtp(cp),
-        SquadmateSetupEmailMethod::Sendmail => cmd_setup_sendmail(cp),
+        Some(email_method) => {
+            match email_method {
+                SquadmateSetupEmailMethod::Smtp => cmd_setup_smtp(cp),
+                SquadmateSetupEmailMethod::Sendmail => cmd_setup_sendmail(cp),
+            }
+        }
+        None => {
+            let conf = cp.config().unwrap_or_else(|_| {
+                eprintln!("Not configured yet! Run with `--help` to show setup commands");
+                process::exit(1);
+            });
+
+            println!("Transport: {}", conf.email_setting);
+            println!("From Address: {}", conf.email);
+            if conf.squadmates.is_empty() {
+                println!("No squadmates! Add some with `cmacm add \"John Doe\" johndoe@example.com`");
+            } else {
+                println!("Squadmates:");
+                for squadmate in conf.squadmates {
+                    println!("\t{}", squadmate);
+                }
+            }
+        },
     }
 }
 
 fn cmd_add(cp: &mut CivilProtection, args: &SquadmateAddArgs) {
     check_config(&cp);
 
-    cp.add_squadmate(email::Identity {
+    let squadmate = email::Identity {
         name: args.name.clone(),
         email: args.email.clone(),
-    })
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to add squadmate: {}", e);
-        process::exit(1);
-    });
+    };
 
-    println!("Successfully added squadmate");
+    cp.add_squadmate(squadmate.clone())
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to add squadmate: {}", e);
+            process::exit(1);
+        });
+
+    println!("Successfully added squadmate: {}", squadmate);
 }
 
 fn cmd_remove(cp: &mut CivilProtection, args: &SquadmateRmArgs) {
     check_config(&cp);
 
-    match args.field_type {
+    let squadmate = match args.field_type {
         SquadmateRmFieldType::Name => {
-            let squadmate = cp
-                .find_squadmate_by_name(args.value.as_str())
+            cp.find_squadmate_by_name(args.value.as_str())
                 .unwrap_or_else(|e| {
                     eprintln!("Error trying to find squadmate with name {}: {}", args.value, e);
                     process::exit(1);
@@ -219,18 +251,9 @@ fn cmd_remove(cp: &mut CivilProtection, args: &SquadmateRmArgs) {
                     eprintln!("Unable to find squadmate with name {}", args.value);
                     process::exit(1);
                 })
-                .clone();
-
-            cp.rm_squadmate(&squadmate).unwrap_or_else(|e| {
-                eprintln!("Failed to remove squadmate: {}", e);
-                process::exit(1);
-            });
-
-            println!("Successfully removed squadmate {} <{}>", squadmate.name, squadmate.email);
         },
         SquadmateRmFieldType::Email => {
-            let squadmate = cp
-                .find_squadmate_by_email(args.value.as_str())
+            cp.find_squadmate_by_email(args.value.as_str())
                 .unwrap_or_else(|e| {
                     eprintln!("Error trying to find squadmate with email {}: {}", args.value, e);
                     process::exit(1);
@@ -239,15 +262,27 @@ fn cmd_remove(cp: &mut CivilProtection, args: &SquadmateRmArgs) {
                     eprintln!("Unable to find squadmate with email {}", args.value);
                     process::exit(1);
                 })
-                .clone();
-
-            cp.rm_squadmate(&squadmate).unwrap_or_else(|e| {
-                eprintln!("Failed to remove squadmate: {}", e);
-                process::exit(1);
-            });
-
-            println!("Successfully removed squadmate {} <{}>", squadmate.name, squadmate.email);
         },
+    };
+
+    let mut stdout = io::stdout().lock();
+    let mut stdin = io::stdin().lock();
+
+    let response_yes = prompt_yn(
+        format!("Found squadmate {}, are you sure you want to remove them?", squadmate).as_str(),
+        &mut stdout,
+        &mut stdin,
+    );
+
+    if response_yes {
+        cp.rm_squadmate(&squadmate).unwrap_or_else(|e| {
+            eprintln!("Failed to remove squadmate: {}", e);
+            process::exit(1);
+        });
+
+        println!("Successfully removed squadmate {}", squadmate);
+    } else {
+        println!("Canceled");
     }
 }
 
@@ -268,9 +303,15 @@ fn main() {
     let mut cp = CivilProtection::new();
 
     match &cli.squadmate_cmd {
-        SquadmateCommands::Setup(args) => cmd_setup(&mut cp, args),
-        SquadmateCommands::Add(args) => cmd_add(&mut cp, args),
-        SquadmateCommands::Remove(args) => cmd_remove(&mut cp, args),
-        SquadmateCommands::Test => cmd_test(&mut cp),
+        Some(cmd) => {
+            match &cmd {
+                SquadmateCommands::Setup(args) => cmd_setup(&mut cp, args),
+                SquadmateCommands::Add(args) => cmd_add(&mut cp, args),
+                SquadmateCommands::Remove(args) => cmd_remove(&mut cp, args),
+                SquadmateCommands::Test => cmd_test(&mut cp),
+            }
+        },
+        None => cmd_setup(&mut cp, &SquadmateSetupArgs { email_method: None })
     }
+
 }
